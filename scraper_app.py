@@ -3,6 +3,7 @@ import sys
 import subprocess
 import threading
 import time
+import random
 import tkinter as tk
 from tkinter import scrolledtext, messagebox
 from datetime import datetime, timedelta
@@ -60,9 +61,12 @@ class ScraperApp:
         self.pbr_var = tk.BooleanVar(value=True)
         self.per_var = tk.BooleanVar(value=False)
         
-        tk.Checkbutton(self.cb_frame, text="股價 (Price)", variable=self.price_var).pack(anchor="w")
-        tk.Checkbutton(self.cb_frame, text="本淨比 (PBR)", variable=self.pbr_var).pack(anchor="w")
-        tk.Checkbutton(self.cb_frame, text="本益比 (PER)", variable=self.per_var).pack(anchor="w")
+        self.cb_price = tk.Checkbutton(self.cb_frame, text="股價 (Price)", variable=self.price_var)
+        self.cb_price.pack(anchor="w")
+        self.cb_pbr = tk.Checkbutton(self.cb_frame, text="本淨比 (PBR)", variable=self.pbr_var)
+        self.cb_pbr.pack(anchor="w")
+        self.cb_per = tk.Checkbutton(self.cb_frame, text="本益比 (PER)", variable=self.per_var)
+        self.cb_per.pack(anchor="w")
         
         # 狀態提示標籤 (UI 提示使用者現在作業的期間)
         self.status_lbl = tk.Label(root, text="目前作業期間：尚未開始", fg="blue", font=("Arial", 11, "bold"))
@@ -122,6 +126,11 @@ class ScraperApp:
             return
             
         self.start_btn.config(state='disabled')
+        self.stock_id_entry.config(state='disabled')
+        self.year_limit_entry.config(state='disabled')
+        self.cb_price.config(state='disabled')
+        self.cb_pbr.config(state='disabled')
+        self.cb_per.config(state='disabled')
         self.log("="*30)
         self.log(f"啟動自動化區間多項目爬蟲任務 (任務目標: 往前 {year_limit} 年)...")
         self.log(f"勾選的項目: {', '.join(tasks)}")
@@ -153,6 +162,18 @@ class ScraperApp:
         self.log(f"實作二維矩陣演算法，對齊 HTML 表格欄位並生成純淨 CSV...")
         try:
             import codecs
+            import re
+            
+            # 從檔名提取當前這批資料的結束年份與月份，供後續判定跨年 (檔名格式: YYYY-MM-DD_YYYY-MM-DD_...)
+            base_filename = os.path.basename(csv_path)
+            date_match = re.match(r"(\d{4})-(\d{2})-(\d{2})_", base_filename)
+            if date_match:
+                current_year = int(date_match.group(1))
+                last_month = int(date_match.group(2))
+            else:
+                current_year = datetime.now().year
+                last_month = 12
+
             with codecs.open(xls_path, "r", encoding="utf-8", errors="ignore") as f:
                 content = f.read()
             
@@ -225,6 +246,25 @@ class ScraperApp:
                         continue
                     if row_data[0] == "交易日期" or row_data[0] == flat_headers[0]:
                         continue
+                        
+                    # 處理日期格式 (將本淨比/本益比的 "3月26日" 換算為 "'26/03/26")
+                    date_str = row_data[0].strip() if row_data[0] else ""
+                    match = re.match(r"(\d+)月(\d+)日", date_str)
+                    if match:
+                        month = int(match.group(1))
+                        day = int(match.group(2))
+                        
+                        # 檢查是否往前跨越年度 (例如資料從 1 月回到前一年的 12 月)
+                        if month > last_month and (month - last_month >= 6):
+                            current_year -= 1
+                            
+                        last_month = month
+                        
+                        yy = str(current_year)[-2:]
+                        mm = str(month).zfill(2)
+                        dd = str(day).zfill(2)
+                        row_data[0] = f"'{yy}/{mm}/{dd}"
+
                     writer.writerow(row_data)
 
             self.log(f"成功轉換寫出完美對齊的 CSV : {os.path.basename(csv_path)}")
@@ -379,8 +419,9 @@ class ScraperApp:
                     curr_end_str = curr_start_str
                     iteration += 1
                     
-                    self.log("✅ 【{task}】單次區間作業漂亮完成，將冷卻 20 秒鐘以避免發出過多網路請求被伺服器封鎖...")
-                    time.sleep(20)
+                    sleep_time = random.randint(20, 90)
+                    self.log(f"✅ 【{task}】單次區間作業漂亮完成，將冷卻 {sleep_time} 秒鐘以避免發出過多網路請求被伺服器封鎖...")
+                    time.sleep(sleep_time)
                     
             self.log("🎉🎉 所有勾選項目的自動化區間作業，均已順利執行完畢！🎉🎉")
             self.update_status("💡 滿載而歸！全部工作皆已完成 💡")
@@ -395,6 +436,11 @@ class ScraperApp:
                 driver.quit()
             
             self.start_btn.config(state='normal')
+            self.stock_id_entry.config(state='normal')
+            self.year_limit_entry.config(state='normal')
+            self.cb_price.config(state='normal')
+            self.cb_pbr.config(state='normal')
+            self.cb_per.config(state='normal')
             self.log("系統已就緒釋放，可隨時嘗試新的股號與項目選項。\n" + "-"*50)
 
 if __name__ == "__main__":
