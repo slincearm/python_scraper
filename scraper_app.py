@@ -52,10 +52,16 @@ class ScraperApp:
         self.year_limit_entry.insert(0, "5") # 預設只抓 5 年
         self.year_limit_entry.grid(row=1, column=1, padx=10, pady=10, sticky="w")
 
+        # 抓取時間間隔最大值設定
+        tk.Label(root, text="最大冷卻時間(秒):").grid(row=2, column=0, padx=10, pady=10, sticky="e")
+        self.max_delay_entry = tk.Entry(root)
+        self.max_delay_entry.insert(0, "90") # 預設只抓 90 秒
+        self.max_delay_entry.grid(row=2, column=1, padx=10, pady=10, sticky="w")
+
         # 擷取項目選擇 (Checkboxes)
-        tk.Label(root, text="擷取項目:").grid(row=2, column=0, padx=10, pady=5, sticky="ne")
+        tk.Label(root, text="擷取項目:").grid(row=3, column=0, padx=10, pady=5, sticky="ne")
         self.cb_frame = tk.Frame(root)
-        self.cb_frame.grid(row=2, column=1, sticky="w", pady=5)
+        self.cb_frame.grid(row=3, column=1, sticky="w", pady=5)
         
         self.price_var = tk.BooleanVar(value=False)
         self.pbr_var = tk.BooleanVar(value=True)
@@ -70,15 +76,15 @@ class ScraperApp:
         
         # 狀態提示標籤 (UI 提示使用者現在作業的期間)
         self.status_lbl = tk.Label(root, text="目前作業期間：尚未開始", fg="blue", font=("Arial", 11, "bold"))
-        self.status_lbl.grid(row=3, column=0, columnspan=2, pady=5)
+        self.status_lbl.grid(row=4, column=0, columnspan=2, pady=5)
 
         # 執行按鈕
         self.start_btn = tk.Button(root, text="開始執行自動推迴圈爬蟲", command=self.start_scraping_thread, bg="#4CAF50", fg="white", font=("Arial", 12))
-        self.start_btn.grid(row=4, column=0, columnspan=2, pady=10, ipadx=20)
+        self.start_btn.grid(row=5, column=0, columnspan=2, pady=10, ipadx=20)
         
         # 日誌區
         self.log_area = scrolledtext.ScrolledText(root, width=65, height=14, state='disabled', bg="#f0f0f0")
-        self.log_area.grid(row=5, column=0, columnspan=2, padx=10, pady=10)
+        self.log_area.grid(row=6, column=0, columnspan=2, padx=10, pady=10)
 
     def log(self, message):
         """將訊息輸出到唯讀的日誌區，也同步列印在 Console"""
@@ -112,6 +118,16 @@ class ScraperApp:
             messagebox.showwarning("警告", "抓取年份數必須是有效的正整數！")
             return
             
+        max_delay_str = self.max_delay_entry.get().strip()
+        try:
+            max_delay = int(max_delay_str)
+            if max_delay < 20:
+                messagebox.showwarning("警告", "最大冷卻時間至少需 20 秒以上！")
+                return
+        except ValueError:
+            messagebox.showwarning("警告", "最大冷卻時間必須是有效的整數！")
+            return
+            
         # 收集需要跑的項目
         tasks = []
         if self.price_var.get():
@@ -128,15 +144,17 @@ class ScraperApp:
         self.start_btn.config(state='disabled')
         self.stock_id_entry.config(state='disabled')
         self.year_limit_entry.config(state='disabled')
+        self.max_delay_entry.config(state='disabled')
         self.cb_price.config(state='disabled')
         self.cb_pbr.config(state='disabled')
         self.cb_per.config(state='disabled')
         self.log("="*30)
         self.log(f"啟動自動化區間多項目爬蟲任務 (任務目標: 往前 {year_limit} 年)...")
+        self.log(f"最大冷卻預設間隔: 20 ~ {max_delay} 秒")
         self.log(f"勾選的項目: {', '.join(tasks)}")
         self.log("="*30)
         
-        threading.Thread(target=self.run_scraper, args=(stock_id, year_limit, tasks), daemon=True).start()
+        threading.Thread(target=self.run_scraper, args=(stock_id, year_limit, max_delay, tasks), daemon=True).start()
 
     def wait_for_downloads(self, download_dir, timeout=60):
         """等待檔案完整下載至資料夾"""
@@ -329,7 +347,7 @@ class ScraperApp:
                 
         self.log(f"✅ 合併完成！總共彙整 {len(sorted_dates)} 筆不重複資料，已儲存至: {output_filename}，且已清除舊檔/暫存檔。")
 
-    def run_scraper(self, stock_id, year_limit, tasks):
+    def run_scraper(self, stock_id, year_limit, max_delay, tasks):
         driver = None
         try:
             self.log("正在進行環境檢查與瀏覽器設定...")
@@ -554,7 +572,7 @@ class ScraperApp:
                     curr_end_str = curr_start_str
                     iteration += 1
                     
-                    sleep_time = random.randint(20, 90)
+                    sleep_time = random.randint(20, max_delay)
                     self.log(f"✅ 【{task}】單次區間作業漂亮完成，將冷卻 {sleep_time} 秒鐘以避免發出過多網路請求被伺服器封鎖...")
                     time.sleep(sleep_time)
                     
@@ -578,6 +596,7 @@ class ScraperApp:
             self.start_btn.config(state='normal')
             self.stock_id_entry.config(state='normal')
             self.year_limit_entry.config(state='normal')
+            self.max_delay_entry.config(state='normal')
             self.cb_price.config(state='normal')
             self.cb_pbr.config(state='normal')
             self.cb_per.config(state='normal')
