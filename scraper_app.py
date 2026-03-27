@@ -1,5 +1,12 @@
 import os
 import sys
+
+# 確保在 PyInstaller --noconsole (--windowed) 模式下不會因為 print() 找不到輸出管道而崩潰
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, 'w', encoding='utf-8')
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, 'w', encoding='utf-8')
+
 import subprocess
 import threading
 import time
@@ -156,24 +163,23 @@ class ScraperApp:
         
         threading.Thread(target=self.run_scraper, args=(stock_id, year_limit, max_delay, tasks), daemon=True).start()
 
-    def wait_for_downloads(self, download_dir, timeout=60):
-        """等待檔案完整下載至資料夾"""
+    def wait_for_downloads(self, download_dir, files_before_len, timeout=60):
+        """等待檔案開始創建且完整下載至資料夾"""
         self.log("等待檔案下載安全寫入完成...")
         seconds = 0
-        dl_wait = True
-        while dl_wait and seconds < timeout:
+        while seconds < timeout:
             time.sleep(1)
-            dl_wait = False
             files = os.listdir(download_dir)
-            for fname in files:
-                if fname.endswith('.crdownload') or fname.endswith('.tmp'):
-                    dl_wait = True
+            is_downloading = any(f.endswith('.crdownload') or f.endswith('.tmp') for f in files)
+            
+            if len(files) > files_before_len and not is_downloading:
+                self.log("檔案下載安全寫入完成！")
+                return True
+                
             seconds += 1
             
-        if seconds >= timeout:
-            self.log("[警告] 下載等待逾時，檔案可能未完全寫入。")
-        else:
-            self.log("檔案下載安全寫入完成！")
+        self.log("[警告] 下載等待逾時，檔案可能未完全寫入或網路延遲過高無法下載。")
+        return False
 
     def convert_xls_to_csv(self, xls_path, csv_path):
         """將 Goodinfo 的 HTML Table 解析轉換為標準 CSV，完美修復 colspan/rowspan 表頭錯位，並刪除原檔"""
@@ -351,7 +357,12 @@ class ScraperApp:
         driver = None
         try:
             self.log("正在進行環境檢查與瀏覽器設定...")
-            current_dir = os.path.dirname(os.path.abspath(__file__)) if '__file__' in globals() else os.getcwd()
+            
+            # 使用 sys.frozen 來判斷是否被 Pyinstaller 打包，避免把檔案抓進暫存資料夾
+            if getattr(sys, 'frozen', False):
+                current_dir = os.path.dirname(sys.executable)
+            else:
+                current_dir = os.path.dirname(os.path.abspath(__file__)) if '__file__' in globals() else os.getcwd()
             base_download_dir = os.path.join(current_dir, "Download_Data")
             
             options = Options()
@@ -541,14 +552,15 @@ class ScraperApp:
                     self.log("確認具備表格資料，鎖定「XLS」下載按鈕...")
                     xls_btn = wait.until(EC.presence_of_element_located((By.XPATH, "//input[@value='XLS']")))
                     
-                    # 非常重要: 觀察【目前項目】的獨立目錄以捕捉新增的檔案
+                    # 非常重要: 觀察【目前項目】的獨立目錄以捕捉新增的檔案數
                     files_before = set(os.listdir(task_dir))
+                    files_before_len = len(files_before)
                     
                     self.log("點此觸發原生的檔案下載作業...")
                     driver.execute_script("arguments[0].click();", xls_btn)
                     
-                    # 安全等待機制 (針對該項目的資料夾)
-                    self.wait_for_downloads(task_dir)
+                    # 安全等待機制 (精準比對資料夾新增檔案數量)
+                    self.wait_for_downloads(task_dir, files_before_len)
                     
                     # 揪出新生的假 XLS 檔案
                     files_after = set(os.listdir(task_dir))
@@ -585,8 +597,16 @@ class ScraperApp:
             self.update_status("💡 滿載而歸！全部工作皆已完成 💡")
             
         except Exception as e:
-            self.log(f"❌ 執行期間發生未預料深層錯誤: {str(e)}")
+            import traceback
+            tb = traceback.format_exc()
+            self.log(f"❌ 執行期間發生未預料深層錯誤:\n{tb}")
             self.update_status("❌ 執行中斷 (發生未預知錯誤)")
+            
+        except BaseException as e:
+            import traceback
+            tb = traceback.format_exc()
+            self.log(f"💥 捕捉到底層中斷錯誤 (BaseException):\n{tb}")
+            self.update_status("❌ 執行強制中斷")
             
         finally:
             if driver:

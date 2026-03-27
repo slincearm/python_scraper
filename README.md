@@ -42,3 +42,17 @@ Download_Data/
 ```
 CSV 檔案名稱會附帶該檔案抓取的歷史日期區間供快速辨識。
 
+## 📦 打包為獨立執行檔 (.exe)
+若要將此爬蟲工具打包成不需安裝 Python 環境即可點擊執行的獨立檔案，請使用 `PyInstaller`。本腳本已內建嚴密的目錄捕捉機制與 stdout 防呆，請放心隱藏終端機黑視窗。
+
+**編譯指令 (請於專案根目錄下執行)：**
+```bash
+pyinstaller --onefile --noconsole --clean --exclude-module jedi --hidden-import selenium.webdriver.chrome.webdriver --hidden-import webdriver_manager scraper_app.py
+```
+
+* **參數說明：**
+  * `--onefile`: 將所有依賴模組全部塞進一個乾淨的 `.exe` 檔中。
+  * `--noconsole`: 隱藏背景黑色命令提示字元視窗。腳本內部已攔截 `sys.stdout` 避免了無 Console 導致的當機錯誤。
+  * `--exclude-module jedi`: 強制排除非必要的程式碼補全套件 `jedi`，避免因路徑過長引發 `Failed to extract` 的解壓縮報錯問題，也能縮減檔案大小。
+  * `--hidden-import ...`: 明確宣告動態隱藏引入的 webdriver 模組，避免執行時拋出 `ModuleNotFoundError` 閃退。
+
