@@ -164,9 +164,9 @@ class ScraperApp:
             import codecs
             import re
             
-            # 從檔名提取當前這批資料的結束年份與月份，供後續判定跨年 (檔名格式: YYYY-MM-DD_YYYY-MM-DD_...)
+            # 從檔名提取當前這批資料的結束年份與月份，供後續判定跨年 (檔名支援多種分隔符)
             base_filename = os.path.basename(csv_path)
-            date_match = re.match(r"(\d{4})-(\d{2})-(\d{2})_", base_filename)
+            date_match = re.search(r"(\d{4})[-_](\d{2})[-_](\d{2})", base_filename)
             if date_match:
                 current_year = int(date_match.group(1))
                 last_month = int(date_match.group(2))
@@ -247,9 +247,9 @@ class ScraperApp:
                     if row_data[0] == "交易日期" or row_data[0] == flat_headers[0]:
                         continue
                         
-                    # 處理日期格式 (將本淨比/本益比的 "3月26日" 換算為 "'26/03/26")
+                    # 處理日期格式 (將本淨比/本益比原始的 "MM/DD" 換算為統一的 "'YY/MM/DD")
                     date_str = row_data[0].strip() if row_data[0] else ""
-                    match = re.match(r"(\d+)月(\d+)日", date_str)
+                    match = re.match(r"^(\d{2})/(\d{2})$", date_str)
                     if match:
                         month = int(match.group(1))
                         day = int(match.group(2))
