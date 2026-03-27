@@ -277,10 +277,11 @@ class ScraperApp:
             self.log(f"[錯誤] CSV 表列二維重整過程發生異常: {str(e)}")
             return False
 
-    def merge_csv_files(self, target_dir):
+    def merge_csv_files(self, target_dir, task=""):
         """合併資料夾內所有 CSV，去重並依日期由新到舊排序"""
         self.log(f"開始掃描並合併資料夾內的 CSV: {target_dir}")
-        all_files = [f for f in os.listdir(target_dir) if f.endswith('.csv') and not f.endswith('_Result.csv')]
+        # 將舊有的 _Result.csv 也納入合併對象
+        all_files = [f for f in os.listdir(target_dir) if f.endswith('.csv')]
         if not all_files:
             self.log("[警告] 沒有找到可合併的 CSV 檔案。")
             return
@@ -309,7 +310,7 @@ class ScraperApp:
         # 日期格式為 'yy/mm/dd，字串降序排序剛好符合新到舊
         sorted_dates = sorted(data_dict.keys(), reverse=True)
         today_str = datetime.now().strftime("%Y-%m-%d")
-        output_filename = f"{today_str}_Result.csv"
+        output_filename = f"{today_str}_{task.upper()}_Result.csv" if task else f"{today_str}_Result.csv"
         output_filepath = os.path.join(target_dir, output_filename)
         
         with open(output_filepath, 'w', encoding='utf-8-sig', newline='') as f:
@@ -318,7 +319,15 @@ class ScraperApp:
             for d in sorted_dates:
                 writer.writerow(data_dict[d])
                 
-        self.log(f"✅ 合併完成！總共彙整 {len(sorted_dates)} 筆不重複資料，已儲存至: {output_filename}")
+        # 加入: 刪除已被合併的碎檔以及舊有的 Result.csv
+        for filename in all_files:
+            if filename != output_filename:
+                try:
+                    os.remove(os.path.join(target_dir, filename))
+                except Exception as e:
+                    self.log(f"[警告] 移除已合併檔案 {filename} 時發生錯誤: {e}")
+                
+        self.log(f"✅ 合併完成！總共彙整 {len(sorted_dates)} 筆不重複資料，已儲存至: {output_filename}，且已清除舊檔/暫存檔。")
 
     def run_scraper(self, stock_id, year_limit, tasks):
         driver = None
@@ -382,8 +391,91 @@ class ScraperApp:
                 driver.get(base_url)
                 time.sleep(2) # 導航初次暖機
                 
-                # 開始自動推時域的無盡迴圈
                 curr_end_str = datetime.now().strftime("%Y-%m-%d")
+                curr_start_str = None
+                
+                # 檢查是否有既有的 Result.csv (讀取最新一筆日期)
+                existing_files = [f for f in os.listdir(task_dir) if f.endswith('_Result.csv')]
+                if existing_files:
+                    existing_files.sort(reverse=True)
+                    latest_csv = os.path.join(task_dir, existing_files[0])
+                    try:
+                        import csv
+                        import re
+                        with open(latest_csv, 'r', encoding='utf-8-sig') as f:
+                            reader = csv.reader(f)
+                            header = next(reader, None) # 略過 header
+                            first_row = next(reader, None)
+                            if first_row and first_row[0]:
+                                date_str = first_row[0].replace("'", "").strip()
+                                # 解析 "YY/MM/DD" 或 "YYYY/MM/DD"
+                                match = re.match(r"(\d+)[-/](\d+)[-/](\d+)", date_str)
+                                if match:
+                                    y, m, d = match.groups()
+                                    y = int(y)
+                                    y = 2000 + y if y < 50 else (1900 + y if y < 100 else y)
+                                    curr_start_str = f"{y:04d}-{int(m):02d}-{int(d):02d}"
+                    except Exception as e:
+                        self.log(f"【{task}】讀取舊有 Result.csv 失敗: {e}")
+                
+                if curr_start_str:
+                    self.log(f"【{task}】讀取到 Result.csv 最新資料日期為: {curr_start_str}")
+                    if curr_start_str == curr_end_str:
+                        self.log(f"💡 【{task}】最新資料日期與今日 ({curr_end_str}) 相同，不需要重複抓取。")
+                        self.update_status(f"【{task}】資料已是最新，跳過。")
+                        continue
+                        
+                    self.log(f"💡 發現舊紀錄，將自動設定起始日期為: {curr_start_str}，結束日期為當日: {curr_end_str} 進行更新抓取。")
+                    self.update_status(f"【{task}】正在更新區間: {curr_start_str} ~ {curr_end_str}")
+                    
+                    try:
+                        start_input = wait.until(EC.presence_of_element_located((By.ID, "edtSTART_TIME")))
+                        driver.execute_script("arguments[0].value = arguments[1]; arguments[0].dispatchEvent(new Event('change'));", start_input, curr_start_str)
+                        
+                        end_input = wait.until(EC.presence_of_element_located((By.ID, "edtEND_TIME")))
+                        driver.execute_script("arguments[0].value = arguments[1]; arguments[0].dispatchEvent(new Event('change'));", end_input, curr_end_str)
+                        time.sleep(1)
+                        
+                        self.log("點擊「查詢」按鈕，獲取最新區間資料...")
+                        try:
+                            # 嘗試點擊標準的查詢按鈕
+                            query_btn = wait.until(EC.presence_of_element_located((By.XPATH, "//input[@type='button' and @value='查詢']")))
+                            driver.execute_script("arguments[0].click();", query_btn)
+                        except:
+                            self.log("尋找「查詢」按鈕超時，嘗試使用備案腳本提交表單...")
+                            # 備案: 直接戳 btnQUERY，或是送出表單
+                            driver.execute_script("var btn = document.getElementById('btnQUERY'); if(btn) btn.click(); else document.forms[0].submit();")
+                        
+                        time.sleep(5)
+                        
+                        div_details = driver.find_elements(By.ID, "divDetailBox")
+                        if div_details and "查無相關資料" in div_details[0].text:
+                            self.log("💡 [提示] 此區間內查無新的交易紀錄。")
+                        else:
+                            xls_btn = wait.until(EC.presence_of_element_located((By.XPATH, "//input[@value='XLS']")))
+                            files_before = set(os.listdir(task_dir))
+                            driver.execute_script("arguments[0].click();", xls_btn)
+                            self.wait_for_downloads(task_dir)
+                            
+                            files_after = set(os.listdir(task_dir))
+                            new_files = list(files_after - files_before)
+                            if new_files:
+                                xls_filename = new_files[0]
+                                xls_path = os.path.join(task_dir, xls_filename)
+                                base_name = os.path.splitext(xls_filename)[0]
+                                csv_filename = f"{curr_end_str}_{curr_start_str}_{base_name}.csv"
+                                csv_path = os.path.join(task_dir, csv_filename)
+                                self.convert_xls_to_csv(xls_path, csv_path)
+                    except Exception as e:
+                        self.log(f"❌ 區間更新發生錯誤: {e}")
+                        
+                    self.log(f"【{task}】資料更新下載完畢，進行合併排序作業...")
+                    self.merge_csv_files(task_dir, task)
+                    continue  # 此項目的更新完成，進入下一個 task
+                
+                self.log(f"【{task}】未發現歷史紀錄，將執行原始的多年度回推抓取作業。")
+                
+                # 開始自動推時域的無盡迴圈 (全新抓取模式)
                 iteration = 1
                 
                 while True:
@@ -468,7 +560,8 @@ class ScraperApp:
                     
                 # 該項目所有年度抓取完畢 (while 迴圈結束)，執行合併作業
                 self.log(f"【{task}】區間下載已完成，開始進行合併與去重排序作業...")
-                self.merge_csv_files(task_dir)
+                self.merge_csv_files(task_dir, task)
+                
                     
             self.log("🎉🎉 所有勾選項目的自動化區間作業，均已順利執行完畢！🎉🎉")
             self.update_status("💡 滿載而歸！全部工作皆已完成 💡")
