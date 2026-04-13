@@ -36,7 +36,7 @@ from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 from bs4 import BeautifulSoup
@@ -49,7 +49,7 @@ class ScraperApp:
         
         # UI Components
         # 股號輸入
-        tk.Label(root, text="股號:").grid(row=0, column=0, padx=10, pady=10, sticky="e")
+        tk.Label(root, text="股號 (多筆以分號隔開):").grid(row=0, column=0, padx=10, pady=10, sticky="e")
         self.stock_id_entry = tk.Entry(root)
         self.stock_id_entry.grid(row=0, column=1, padx=10, pady=10, sticky="w")
         
@@ -73,6 +73,8 @@ class ScraperApp:
         self.price_var = tk.BooleanVar(value=False)
         self.pbr_var = tk.BooleanVar(value=True)
         self.per_var = tk.BooleanVar(value=False)
+        self.inst_var = tk.BooleanVar(value=False)
+        self.bias_var = tk.BooleanVar(value=False)
         
         self.cb_price = tk.Checkbutton(self.cb_frame, text="股價 (Price)", variable=self.price_var)
         self.cb_price.pack(anchor="w")
@@ -80,6 +82,10 @@ class ScraperApp:
         self.cb_pbr.pack(anchor="w")
         self.cb_per = tk.Checkbutton(self.cb_frame, text="本益比 (PER)", variable=self.per_var)
         self.cb_per.pack(anchor="w")
+        self.cb_inst = tk.Checkbutton(self.cb_frame, text="法人買賣", variable=self.inst_var)
+        self.cb_inst.pack(anchor="w")
+        self.cb_bias = tk.Checkbutton(self.cb_frame, text="乖離率", variable=self.bias_var)
+        self.cb_bias.pack(anchor="w")
         
         # 狀態提示標籤 (UI 提示使用者現在作業的期間)
         self.status_lbl = tk.Label(root, text="目前作業期間：尚未開始", fg="blue", font=("Arial", 11, "bold"))
@@ -111,9 +117,11 @@ class ScraperApp:
 
     def start_scraping_thread(self):
         """啟動背景執行緒來跑爬蟲，避免把 UI 執行緒卡死"""
-        stock_id = self.stock_id_entry.get().strip()
-        if not stock_id:
-            messagebox.showwarning("警告", "請輸入股號！")
+        stock_ids_raw = self.stock_id_entry.get()
+        stock_ids = [s.strip() for s in stock_ids_raw.split(';') if s.strip()]
+        
+        if not stock_ids:
+            messagebox.showwarning("警告", "請輸入至少一個股號！")
             return
             
         year_limit_str = self.year_limit_entry.get().strip()
@@ -128,8 +136,8 @@ class ScraperApp:
         max_delay_str = self.max_delay_entry.get().strip()
         try:
             max_delay = int(max_delay_str)
-            if max_delay < 20:
-                messagebox.showwarning("警告", "最大冷卻時間至少需 20 秒以上！")
+            if max_delay < 60:
+                messagebox.showwarning("警告", "最大冷卻時間至少需 60 秒以上！")
                 return
         except ValueError:
             messagebox.showwarning("警告", "最大冷卻時間必須是有效的整數！")
@@ -138,11 +146,15 @@ class ScraperApp:
         # 收集需要跑的項目
         tasks = []
         if self.price_var.get():
-            tasks.append("Price")
+            tasks.append("個股K線")
         if self.pbr_var.get():
-            tasks.append("PBR")
+            tasks.append("本淨比")
         if self.per_var.get():
-            tasks.append("PER")
+            tasks.append("本益比")
+        if self.inst_var.get():
+            tasks.append("法人買賣")
+        if self.bias_var.get():
+            tasks.append("乖離率")
             
         if not tasks:
             messagebox.showwarning("警告", "請至少勾選一個抓取項目！")
@@ -155,13 +167,16 @@ class ScraperApp:
         self.cb_price.config(state='disabled')
         self.cb_pbr.config(state='disabled')
         self.cb_per.config(state='disabled')
+        self.cb_inst.config(state='disabled')
+        self.cb_bias.config(state='disabled')
         self.log("="*30)
         self.log(f"啟動自動化區間多項目爬蟲任務 (任務目標: 往前 {year_limit} 年)...")
         self.log(f"最大冷卻預設間隔: 20 ~ {max_delay} 秒")
+        self.log(f"批次追蹤股號清單: {', '.join(stock_ids)}")
         self.log(f"勾選的項目: {', '.join(tasks)}")
         self.log("="*30)
         
-        threading.Thread(target=self.run_scraper, args=(stock_id, year_limit, max_delay, tasks), daemon=True).start()
+        threading.Thread(target=self.run_scraper, args=(stock_ids, year_limit, max_delay, tasks), daemon=True).start()
 
     def wait_for_downloads(self, download_dir, files_before_len, timeout=60):
         """等待檔案開始創建且完整下載至資料夾"""
@@ -302,58 +317,279 @@ class ScraperApp:
             return False
 
     def merge_csv_files(self, target_dir, task=""):
-        """合併資料夾內所有 CSV，去重並依日期由新到舊排序"""
-        self.log(f"開始掃描並合併資料夾內的 CSV: {target_dir}")
-        # 將舊有的 _Result.csv 也納入合併對象
+        """依選項分組合併資料夾內所有 CSV，去重並依日期由新到舊排序"""
+        self.log(f"【{task}】開始歸納並分組合併資料夾內的 CSV: {target_dir}")
         all_files = [f for f in os.listdir(target_dir) if f.endswith('.csv')]
         if not all_files:
             self.log("[警告] 沒有找到可合併的 CSV 檔案。")
             return
             
-        header = None
-        data_dict = {}
+        groups = {}
         for filename in all_files:
-            filepath = os.path.join(target_dir, filename)
-            with open(filepath, 'r', encoding='utf-8-sig') as f:
-                reader = csv.reader(f)
-                try:
-                    current_header = next(reader)
-                    if header is None:
-                        header = current_header
-                    for row in reader:
-                        if not row:
-                            continue
-                        date_val = row[0]
-                        if date_val == "交易日期" or date_val == header[0]:
-                            continue
-                        # 相同日期若已存在，直接覆蓋 (保留一筆)
-                        data_dict[date_val] = row
-                except StopIteration:
-                    pass
-                    
-        # 日期格式為 'yy/mm/dd，字串降序排序剛好符合新到舊
-        sorted_dates = sorted(data_dict.keys(), reverse=True)
+            # 檔名格式: {option_text}_{start_str}_{end_str}.csv 或 {option_text}_{end_str}_Result.csv
+            parts = filename.replace('.csv', '').rsplit('_', 2)
+            if len(parts) >= 3:
+                group_name = parts[0]
+            else:
+                group_name = task # fallback
+                
+            if group_name not in groups:
+                groups[group_name] = []
+            groups[group_name].append(filename)
+            
         today_str = datetime.now().strftime("%Y-%m-%d")
-        output_filename = f"{today_str}_{task.upper()}_Result.csv" if task else f"{today_str}_Result.csv"
-        output_filepath = os.path.join(target_dir, output_filename)
         
-        with open(output_filepath, 'w', encoding='utf-8-sig', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(header)
-            for d in sorted_dates:
-                writer.writerow(data_dict[d])
-                
-        # 加入: 刪除已被合併的碎檔以及舊有的 Result.csv
-        for filename in all_files:
-            if filename != output_filename:
-                try:
-                    os.remove(os.path.join(target_dir, filename))
-                except Exception as e:
-                    self.log(f"[警告] 移除已合併檔案 {filename} 時發生錯誤: {e}")
-                
-        self.log(f"✅ 合併完成！總共彙整 {len(sorted_dates)} 筆不重複資料，已儲存至: {output_filename}，且已清除舊檔/暫存檔。")
+        for group_name, files in groups.items():
+            header = None
+            data_dict = {}
+            for filename in files:
+                filepath = os.path.join(target_dir, filename)
+                with open(filepath, 'r', encoding='utf-8-sig') as f:
+                    reader = csv.reader(f)
+                    try:
+                        current_header = next(reader)
+                        if header is None:
+                            header = current_header
+                        for row in reader:
+                            if not row:
+                                continue
+                            date_val = row[0]
+                            if date_val == "交易日期" or date_val == header[0]:
+                                continue
+                            data_dict[date_val] = row
+                    except StopIteration:
+                        pass
+                        
+            sorted_dates = sorted(data_dict.keys(), reverse=True)
+            # 新規則: {option顯示的文字}_{結束時間}_Result.csv
+            output_filename = f"{group_name}_{today_str}_Result.csv"
+            output_filepath = os.path.join(target_dir, output_filename)
+            
+            with open(output_filepath, 'w', encoding='utf-8-sig', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(header)
+                for d in sorted_dates:
+                    writer.writerow(data_dict[d])
+                    
+            for filename in files:
+                if filename != output_filename:
+                    try:
+                        os.remove(os.path.join(target_dir, filename))
+                    except Exception as e:
+                        self.log(f"[警告] 移除已合併檔案 {filename} 時發生錯誤: {e}")
+                        
+            self.log(f"✅ 群組 [{group_name}] 合併完成！保留 {len(sorted_dates)} 筆資料並清除切片。儲存為: {output_filename}")
 
-    def run_scraper(self, stock_id, year_limit, max_delay, tasks):
+    def download_xls_and_convert(self, driver, wait, task_dir, curr_start_str, curr_end_str, task):
+        # 尋找是否具備下拉選單 selKCSheet
+        select_elements = driver.find_elements(By.ID, "selKCSheet")
+        if select_elements:
+            total_options = len(Select(select_elements[0]).options)
+            for i in range(total_options):
+                # 重新抓取避免 DOM 失效
+                sel_elem = wait.until(EC.presence_of_element_located((By.ID, "selKCSheet")))
+                dropdown = Select(sel_elem)
+                opt = dropdown.options[i]
+                
+                # 判斷是否可用
+                if opt.is_enabled() and opt.get_attribute('disabled') is None:
+                    opt_text = opt.text
+                    self.log(f"【{task}】自動切換至選項: {opt_text}")
+                    dropdown.select_by_index(i)
+                    time.sleep(3) # Wait for Ajax loading
+                    
+                    div_details = driver.find_elements(By.ID, "divDetailBox")
+                    if div_details and "查無相關資料" in div_details[0].text:
+                        self.log(f"【{task}】選項 {opt_text} 查無資料，自動跳過。")
+                        continue
+                        
+                    self._execute_single_download(driver, wait, task_dir, curr_start_str, curr_end_str, opt_text)
+        else:
+            self._execute_single_download(driver, wait, task_dir, curr_start_str, curr_end_str, task)
+
+    def _execute_single_download(self, driver, wait, task_dir, curr_start_str, curr_end_str, opt_text):
+        self.log(f"等待點擊下載 XLS 與轉檔 ({opt_text})...")
+        xls_btn = wait.until(EC.presence_of_element_located((By.XPATH, "//input[@value='XLS']")))
+        files_before = set(os.listdir(task_dir))
+        driver.execute_script("arguments[0].click();", xls_btn)
+        self.wait_for_downloads(task_dir, len(files_before))
+        
+        files_after = set(os.listdir(task_dir))
+        new_files = list(files_after - files_before)
+        if new_files:
+            xls_filename = new_files[0]
+            xls_path = os.path.join(task_dir, xls_filename)
+            # 全新命名規則: {option顯示的文字}_{起始時間}_{結束時間}.csv
+            csv_filename = f"{opt_text}_{curr_start_str}_{curr_end_str}.csv"
+            csv_path = os.path.join(task_dir, csv_filename)
+            self.convert_xls_to_csv(xls_path, csv_path)
+
+    def _process_single_stock(self, driver, wait, stock_id, base_download_dir, year_limit, max_delay, tasks):
+        # 依照勾選的項目依序執行
+        for task in tasks:
+            self.log(f"\n==========================================")
+            self.log(f"🌟 正在執行新項目：【 {task} 】 🌟")
+            self.log(f"==========================================")
+            
+            # 建立該項目的專屬資料夾
+            task_dir = os.path.join(base_download_dir, stock_id, task)
+            os.makedirs(task_dir, exist_ok=True)
+            self.log(f"設定 【{task}】 下載目的地為: {task_dir}")
+            
+            # 最強絕招：利用執行 Chrome DevTools Protocol (CDP) 瞬間改變下載路徑
+            driver.execute_cdp_cmd('Page.setDownloadBehavior', {
+                'behavior': 'allow',
+                'downloadPath': task_dir
+            })
+            
+            # 分派該項目的入口網址
+            if task == "個股K線":
+                base_url = f"https://goodinfo.tw/tw/ShowK_Chart.asp?STOCK_ID={stock_id}&CHT_CAT=DATE"
+            elif task == "本淨比":
+                base_url = f"https://goodinfo.tw/tw/ShowK_ChartFlow.asp?RPT_CAT=PBR&STOCK_ID={stock_id}&CHT_CAT=DATE"
+            elif task == "本益比":
+                base_url = f"https://goodinfo.tw/tw/ShowK_ChartFlow.asp?RPT_CAT=PER&STOCK_ID={stock_id}&CHT_CAT=DATE"
+            elif task == "法人買賣":
+                base_url = f"https://goodinfo.tw/tw/ShowBuySaleChart.asp?STOCK_ID={stock_id}&CHT_CAT=DATE"
+            elif task == "乖離率":
+                base_url = f"https://goodinfo.tw/tw/ShowK_ChartFlow.asp?RPT_CAT=DR_3M&STOCK_ID={stock_id}&CHT_CAT=DATE"
+            else:
+                continue
+                
+            self.log(f"【{task}】導航至入口網址: {base_url}")
+            driver.get(base_url)
+            time.sleep(2) # 導航初次暖機
+            
+            curr_end_str = datetime.now().strftime("%Y-%m-%d")
+            curr_start_str = None
+            
+            # 檢查是否有既有的 Result.csv (讀取最新一筆日期)
+            existing_files = []
+            for f in os.listdir(task_dir):
+                if task == "法人買賣":
+                    if re.match(r"^\d{4}-\d{2}-\d{2}_", f) is None and f.endswith(".csv"):
+                        existing_files.append(f)
+                else:
+                    if f.endswith('_Result.csv'):
+                        existing_files.append(f)
+
+            if existing_files:
+                existing_files.sort(reverse=True)
+                latest_csv = os.path.join(task_dir, existing_files[0])
+                try:
+                    import csv
+                    import re
+                    with open(latest_csv, 'r', encoding='utf-8-sig') as f:
+                        reader = csv.reader(f)
+                        header = next(reader, None) # 略過 header
+                        first_row = next(reader, None)
+                        if first_row and first_row[0]:
+                            date_str = first_row[0].replace("'", "").strip()
+                            match = re.match(r"(\d+)[-/](\d+)[-/](\d+)", date_str)
+                            if match:
+                                y, m, d = match.groups()
+                                y = int(y)
+                                y = 2000 + y if y < 50 else (1900 + y if y < 100 else y)
+                                curr_start_str = f"{y:04d}-{int(m):02d}-{int(d):02d}"
+                except Exception as e:
+                    self.log(f"【{task}】讀取舊有 Result.csv 失敗: {e}")
+            
+            if curr_start_str:
+                self.log(f"【{task}】讀取到 Result.csv 最新資料日期為: {curr_start_str}")
+                if curr_start_str == curr_end_str:
+                    self.log(f"💡 【{task}】最新資料日期與今日 ({curr_end_str}) 相同，不需要重複抓取。")
+                    self.update_status(f"【{task}】資料已是最新，跳過。")
+                    continue
+                    
+                self.log(f"💡 發現舊紀錄，將自動設定起始日期為: {curr_start_str}，結束日期為當日: {curr_end_str} 進行更新抓取。")
+                self.update_status(f"【{task}】正在更新區間: {curr_start_str} ~ {curr_end_str}")
+                
+                try:
+                    start_input = wait.until(EC.presence_of_element_located((By.ID, "edtSTART_TIME")))
+                    driver.execute_script("arguments[0].value = arguments[1]; arguments[0].dispatchEvent(new Event('change'));", start_input, curr_start_str)
+                    
+                    end_input = wait.until(EC.presence_of_element_located((By.ID, "edtEND_TIME")))
+                    driver.execute_script("arguments[0].value = arguments[1]; arguments[0].dispatchEvent(new Event('change'));", end_input, curr_end_str)
+                    time.sleep(1)
+                    
+                    self.log("點擊「查詢」按鈕，獲取最新區間資料...")
+                    try:
+                        query_btn = wait.until(EC.presence_of_element_located((By.XPATH, "//input[@type='button' and @value='查詢']")))
+                        driver.execute_script("arguments[0].click();", query_btn)
+                    except:
+                        self.log("尋找「查詢」按鈕超時，嘗試使用備案腳本提交表單...")
+                        driver.execute_script("var btn = document.getElementById('btnQUERY'); if(btn) btn.click(); else document.forms[0].submit();")
+                    
+                    time.sleep(5)
+                    
+                    div_details = driver.find_elements(By.ID, "divDetailBox")
+                    if div_details and "查無相關資料" in div_details[0].text:
+                        self.log("💡 [提示] 此區間內查無新的交易紀錄。")
+                    else:
+                        self.download_xls_and_convert(driver, wait, task_dir, curr_start_str, curr_end_str, task)
+                except Exception as e:
+                    self.log(f"❌ 區間更新發生錯誤: {e}")
+                    
+                self.log(f"【{task}】資料更新下載完畢，進行合併排序作業...")
+                self.merge_csv_files(task_dir, task)
+                continue  # 此項目的更新完成，進入下一個 task
+            
+            self.log(f"【{task}】未發現歷史紀錄，將執行原始的多年度回推抓取作業。")
+            
+            iteration = 1
+            while True:
+                if iteration > year_limit:
+                    self.log(f"✅ 【{task}】已順利達到您設定的抓取上限 ({year_limit} 年)，將在此終止，不繼續往前追溯。")
+                    self.update_status(f"💡 【{task}】已滿 {year_limit} 年歷史資料 💡")
+                    break
+
+                self.update_status(f"【{task}】正在設定結束時間: {curr_end_str}...")
+                self.log(f"\n>>>> [項目: {task} | 第 {iteration} 次資料查找] 準備區間結尾: {curr_end_str} <<<<")
+                
+                self.log("鎖定網頁裡面的結束日期輸入框...")
+                end_input = wait.until(EC.presence_of_element_located((By.ID, "edtEND_TIME")))
+                
+                self.log(f"植入結束時間 '{curr_end_str}' ...")
+                driver.execute_script("arguments[0].value = arguments[1]; arguments[0].dispatchEvent(new Event('change'));", end_input, curr_end_str)
+                time.sleep(1)
+                
+                self.log("點擊「查1年」按鈕，觸發系統自動推前一年的 Ajax...")
+                query_year_btn = wait.until(EC.presence_of_element_located((By.XPATH, "//input[@value='查1年']")))
+                driver.execute_script("arguments[0].click();", query_year_btn)
+                
+                self.log("暫停 5 秒讓資料庫有充足時間回應並渲染回前端...")
+                time.sleep(5)
+                
+                self.log("讀取系統自動推算完畢的起始時間...")
+                start_input = wait.until(EC.presence_of_element_located((By.ID, "edtSTART_TIME")))
+                curr_start_str = driver.execute_script("return arguments[0].value;", start_input)
+                
+                range_text = f"{curr_start_str} ~ {curr_end_str}"
+                self.update_status(f"【{task}】實際抓取區間: {range_text}")  
+                self.log(f"系統實際抓取的區間為: {range_text}")
+                
+                self.log("解析網頁內文元素，判定資料盡頭...")
+                div_details = driver.find_elements(By.ID, "divDetailBox")
+                if div_details and "查無相關資料" in div_details[0].text:
+                    self.log("🚨 [偵測停止訊號] 網頁文字包含「查無相關資料!!」")
+                    self.log(f"🚨 說明這檔股票的歷史掛牌資料已撈取殆盡，結束【{task}】的迴圈流程。")
+                    self.update_status(f"💡 【{task}】全數歷史資料已達極限 💡")
+                    break
+                
+                self.log("確認具備表格資料，開始執行下拉選單爬取或常規下載...")
+                self.download_xls_and_convert(driver, wait, task_dir, curr_start_str, curr_end_str, task)
+                
+                curr_end_str = curr_start_str
+                iteration += 1
+                
+                sleep_time = random.randint(20, max_delay)
+                self.log(f"✅ 【{task}】單次區間作業漂亮完成，將冷卻 {sleep_time} 秒鐘以避免發出過多網路請求被伺服器封鎖...")
+                time.sleep(sleep_time)
+                
+            self.log(f"【{task}】區間下載已完成，開始進行合併與去重排序作業...")
+            self.merge_csv_files(task_dir, task)
+
+    def run_scraper(self, stock_ids, year_limit, max_delay, tasks):
         driver = None
         try:
             self.log("正在進行環境檢查與瀏覽器設定...")
@@ -388,212 +624,18 @@ class ScraperApp:
             driver.minimize_window() # 最小化視窗，不影響使用者工作
             wait = WebDriverWait(driver, 15)
             
-            # 依照勾選的項目依序執行
-            for task in tasks:
-                self.log(f"\n==========================================")
-                self.log(f"🌟 正在執行新項目：【 {task} 】 🌟")
-                self.log(f"==========================================")
-                
-                # 建立該項目的專屬資料夾
-                task_dir = os.path.join(base_download_dir, task)
-                os.makedirs(task_dir, exist_ok=True)
-                self.log(f"設定 【{task}】 下載目的地為: {task_dir}")
-                
-                # 最強絕招：利用執行 Chrome DevTools Protocol (CDP) 瞬間改變下載路徑
-                # 不須重啟 Chrome 即可對應 Price, PBR, PER 資料夾存放
-                driver.execute_cdp_cmd('Page.setDownloadBehavior', {
-                    'behavior': 'allow',
-                    'downloadPath': task_dir
-                })
-                
-                # 分派該項目的入口網址
-                if task == "Price":
-                    base_url = f"https://goodinfo.tw/tw/ShowK_Chart.asp?STOCK_ID={stock_id}&CHT_CAT=DATE&PRICE_ADJ=F"
-                elif task == "PBR":
-                    base_url = f"https://goodinfo.tw/tw/ShowK_ChartFlow.asp?RPT_CAT=PBR&STOCK_ID={stock_id}&CHT_CAT=DATE"
-                elif task == "PER":
-                    base_url = f"https://goodinfo.tw/tw/ShowK_ChartFlow.asp?RPT_CAT=PER&STOCK_ID={stock_id}&CHT_CAT=DATE"
-                else:
-                    continue
+            for stock_id in stock_ids:
+                try:
+                    self.log(f"\n{'='*50}")
+                    self.log(f"🚀 開始執行批次股號: 【{stock_id}】 🚀")
+                    self.log(f"{'='*50}")
+                    self._process_single_stock(driver, wait, stock_id, base_download_dir, year_limit, max_delay, tasks)
+                except Exception as e:
+                    import traceback
+                    tb = traceback.format_exc()
+                    self.log(f"❌ 股號 【{stock_id}】 處理時發生異常，自動跳轉至下一檔股票:\n{tb}")
                     
-                self.log(f"【{task}】導航至入口網址: {base_url}")
-                driver.get(base_url)
-                time.sleep(2) # 導航初次暖機
-                
-                curr_end_str = datetime.now().strftime("%Y-%m-%d")
-                curr_start_str = None
-                
-                # 檢查是否有既有的 Result.csv (讀取最新一筆日期)
-                existing_files = [f for f in os.listdir(task_dir) if f.endswith('_Result.csv')]
-                if existing_files:
-                    existing_files.sort(reverse=True)
-                    latest_csv = os.path.join(task_dir, existing_files[0])
-                    try:
-                        import csv
-                        import re
-                        with open(latest_csv, 'r', encoding='utf-8-sig') as f:
-                            reader = csv.reader(f)
-                            header = next(reader, None) # 略過 header
-                            first_row = next(reader, None)
-                            if first_row and first_row[0]:
-                                date_str = first_row[0].replace("'", "").strip()
-                                # 解析 "YY/MM/DD" 或 "YYYY/MM/DD"
-                                match = re.match(r"(\d+)[-/](\d+)[-/](\d+)", date_str)
-                                if match:
-                                    y, m, d = match.groups()
-                                    y = int(y)
-                                    y = 2000 + y if y < 50 else (1900 + y if y < 100 else y)
-                                    curr_start_str = f"{y:04d}-{int(m):02d}-{int(d):02d}"
-                    except Exception as e:
-                        self.log(f"【{task}】讀取舊有 Result.csv 失敗: {e}")
-                
-                if curr_start_str:
-                    self.log(f"【{task}】讀取到 Result.csv 最新資料日期為: {curr_start_str}")
-                    if curr_start_str == curr_end_str:
-                        self.log(f"💡 【{task}】最新資料日期與今日 ({curr_end_str}) 相同，不需要重複抓取。")
-                        self.update_status(f"【{task}】資料已是最新，跳過。")
-                        continue
-                        
-                    self.log(f"💡 發現舊紀錄，將自動設定起始日期為: {curr_start_str}，結束日期為當日: {curr_end_str} 進行更新抓取。")
-                    self.update_status(f"【{task}】正在更新區間: {curr_start_str} ~ {curr_end_str}")
-                    
-                    try:
-                        start_input = wait.until(EC.presence_of_element_located((By.ID, "edtSTART_TIME")))
-                        driver.execute_script("arguments[0].value = arguments[1]; arguments[0].dispatchEvent(new Event('change'));", start_input, curr_start_str)
-                        
-                        end_input = wait.until(EC.presence_of_element_located((By.ID, "edtEND_TIME")))
-                        driver.execute_script("arguments[0].value = arguments[1]; arguments[0].dispatchEvent(new Event('change'));", end_input, curr_end_str)
-                        time.sleep(1)
-                        
-                        self.log("點擊「查詢」按鈕，獲取最新區間資料...")
-                        try:
-                            # 嘗試點擊標準的查詢按鈕
-                            query_btn = wait.until(EC.presence_of_element_located((By.XPATH, "//input[@type='button' and @value='查詢']")))
-                            driver.execute_script("arguments[0].click();", query_btn)
-                        except:
-                            self.log("尋找「查詢」按鈕超時，嘗試使用備案腳本提交表單...")
-                            # 備案: 直接戳 btnQUERY，或是送出表單
-                            driver.execute_script("var btn = document.getElementById('btnQUERY'); if(btn) btn.click(); else document.forms[0].submit();")
-                        
-                        time.sleep(5)
-                        
-                        div_details = driver.find_elements(By.ID, "divDetailBox")
-                        if div_details and "查無相關資料" in div_details[0].text:
-                            self.log("💡 [提示] 此區間內查無新的交易紀錄。")
-                        else:
-                            xls_btn = wait.until(EC.presence_of_element_located((By.XPATH, "//input[@value='XLS']")))
-                            files_before = set(os.listdir(task_dir))
-                            driver.execute_script("arguments[0].click();", xls_btn)
-                            self.wait_for_downloads(task_dir)
-                            
-                            files_after = set(os.listdir(task_dir))
-                            new_files = list(files_after - files_before)
-                            if new_files:
-                                xls_filename = new_files[0]
-                                xls_path = os.path.join(task_dir, xls_filename)
-                                base_name = os.path.splitext(xls_filename)[0]
-                                csv_filename = f"{curr_end_str}_{curr_start_str}_{base_name}.csv"
-                                csv_path = os.path.join(task_dir, csv_filename)
-                                self.convert_xls_to_csv(xls_path, csv_path)
-                    except Exception as e:
-                        self.log(f"❌ 區間更新發生錯誤: {e}")
-                        
-                    self.log(f"【{task}】資料更新下載完畢，進行合併排序作業...")
-                    self.merge_csv_files(task_dir, task)
-                    continue  # 此項目的更新完成，進入下一個 task
-                
-                self.log(f"【{task}】未發現歷史紀錄，將執行原始的多年度回推抓取作業。")
-                
-                # 開始自動推時域的無盡迴圈 (全新抓取模式)
-                iteration = 1
-                
-                while True:
-                    if iteration > year_limit:
-                        self.log(f"✅ 【{task}】已順利達到您設定的抓取上限 ({year_limit} 年)，將在此終止，不繼續往前追溯。")
-                        self.update_status(f"💡 【{task}】已滿 {year_limit} 年歷史資料 💡")
-                        break
-
-                    self.update_status(f"【{task}】正在設定結束時間: {curr_end_str}...")
-                    self.log(f"\n>>>> [項目: {task} | 第 {iteration} 次資料查找] 準備區間結尾: {curr_end_str} <<<<")
-                    
-                    # 鎖定網頁裡面的結束日期輸入框...
-                    self.log("鎖定網頁裡面的結束日期輸入框...")
-                    end_input = wait.until(EC.presence_of_element_located((By.ID, "edtEND_TIME")))
-                    
-                    self.log(f"植入結束時間 '{curr_end_str}' ...")
-                    driver.execute_script("arguments[0].value = arguments[1]; arguments[0].dispatchEvent(new Event('change'));", end_input, curr_end_str)
-                    time.sleep(1)
-                    
-                    self.log("點擊「查1年」按鈕，觸發系統自動推前一年的 Ajax...")
-                    query_year_btn = wait.until(EC.presence_of_element_located((By.XPATH, "//input[@value='查1年']")))
-                    driver.execute_script("arguments[0].click();", query_year_btn)
-                    
-                    self.log("暫停 5 秒讓資料庫有充足時間回應並渲染回前端...")
-                    time.sleep(5)
-                    
-                    # 從網頁上抓回系統自動推算出來的起始時間
-                    self.log("讀取系統自動推算完畢的起始時間...")
-                    start_input = wait.until(EC.presence_of_element_located((By.ID, "edtSTART_TIME")))
-                    curr_start_str = driver.execute_script("return arguments[0].value;", start_input)
-                    
-                    range_text = f"{curr_start_str} ~ {curr_end_str}"
-                    self.update_status(f"【{task}】實際抓取區間: {range_text}")  # 更新 UI 給使用者看
-                    self.log(f"系統實際抓取的區間為: {range_text}")
-                    
-                    # 判斷網頁是否顯示「查無相關資料!!」
-                    self.log("解析網頁內文元素，判定資料盡頭...")
-                    div_details = driver.find_elements(By.ID, "divDetailBox")
-                    if div_details and "查無相關資料" in div_details[0].text:
-                        self.log("🚨 [偵測停止訊號] 網頁文字包含「查無相關資料!!」")
-                        self.log(f"🚨 說明這檔股票的歷史掛牌資料已撈取殆盡，結束【{task}】的迴圈流程。")
-                        self.update_status(f"💡 【{task}】全數歷史資料已達極限 💡")
-                        break
-                    
-                    self.log("確認具備表格資料，鎖定「XLS」下載按鈕...")
-                    xls_btn = wait.until(EC.presence_of_element_located((By.XPATH, "//input[@value='XLS']")))
-                    
-                    # 非常重要: 觀察【目前項目】的獨立目錄以捕捉新增的檔案數
-                    files_before = set(os.listdir(task_dir))
-                    files_before_len = len(files_before)
-                    
-                    self.log("點此觸發原生的檔案下載作業...")
-                    driver.execute_script("arguments[0].click();", xls_btn)
-                    
-                    # 安全等待機制 (精準比對資料夾新增檔案數量)
-                    self.wait_for_downloads(task_dir, files_before_len)
-                    
-                    # 揪出新生的假 XLS 檔案
-                    files_after = set(os.listdir(task_dir))
-                    new_files = list(files_after - files_before)
-                    
-                    if new_files:
-                        xls_filename = new_files[0]
-                        self.log(f"捕捉到實體生出的檔案: {xls_filename}")
-                        xls_path = os.path.join(task_dir, xls_filename)
-                        
-                        # (ex: 2026-03-26_2025-03-26_原本的檔名.csv)
-                        base_name = os.path.splitext(xls_filename)[0]
-                        csv_filename = f"{curr_end_str}_{curr_start_str}_{base_name}.csv"
-                        csv_path = os.path.join(task_dir, csv_filename)
-                        
-                        self.convert_xls_to_csv(xls_path, csv_path)
-                    else:
-                        self.log("[警告] 點擊後未發現任何目錄新增檔案，可能當下阻擋或被系統隔離！")
-                    
-                    # 將這一次系統算出來的起始時間，直接繼承為下一次的結束時間！
-                    curr_end_str = curr_start_str
-                    iteration += 1
-                    
-                    sleep_time = random.randint(20, max_delay)
-                    self.log(f"✅ 【{task}】單次區間作業漂亮完成，將冷卻 {sleep_time} 秒鐘以避免發出過多網路請求被伺服器封鎖...")
-                    time.sleep(sleep_time)
-                    
-                # 該項目所有年度抓取完畢 (while 迴圈結束)，執行合併作業
-                self.log(f"【{task}】區間下載已完成，開始進行合併與去重排序作業...")
-                self.merge_csv_files(task_dir, task)
-                
-                    
-            self.log("🎉🎉 所有勾選項目的自動化區間作業，均已順利執行完畢！🎉🎉")
+            self.log("🎉🎉 全任務清單：所有股號自動化作業均已順利執行完畢！🎉🎉")
             self.update_status("💡 滿載而歸！全部工作皆已完成 💡")
             
         except Exception as e:
@@ -620,6 +662,8 @@ class ScraperApp:
             self.cb_price.config(state='normal')
             self.cb_pbr.config(state='normal')
             self.cb_per.config(state='normal')
+            self.cb_inst.config(state='normal')
+            self.cb_bias.config(state='normal')
             self.log("系統已就緒釋放，可隨時嘗試新的股號與項目選項。\n" + "-"*50)
 
 if __name__ == "__main__":
