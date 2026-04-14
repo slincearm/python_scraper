@@ -75,6 +75,7 @@ class ScraperApp:
         self.per_var = tk.BooleanVar(value=False)
         self.inst_var = tk.BooleanVar(value=False)
         self.bias_var = tk.BooleanVar(value=False)
+        self.finance_var = tk.BooleanVar(value=False)
         
         self.cb_price = tk.Checkbutton(self.cb_frame, text="股價 (Price)", variable=self.price_var)
         self.cb_price.pack(anchor="w")
@@ -86,6 +87,8 @@ class ScraperApp:
         self.cb_inst.pack(anchor="w")
         self.cb_bias = tk.Checkbutton(self.cb_frame, text="乖離率", variable=self.bias_var)
         self.cb_bias.pack(anchor="w")
+        self.cb_finance = tk.Checkbutton(self.cb_frame, text="財報", variable=self.finance_var)
+        self.cb_finance.pack(anchor="w")
         
         # 狀態提示標籤 (UI 提示使用者現在作業的期間)
         self.status_lbl = tk.Label(root, text="目前作業期間：尚未開始", fg="blue", font=("Arial", 11, "bold"))
@@ -155,6 +158,8 @@ class ScraperApp:
             tasks.append("法人買賣")
         if self.bias_var.get():
             tasks.append("乖離率")
+        if self.finance_var.get():
+            tasks.append("財報")
             
         if not tasks:
             messagebox.showwarning("警告", "請至少勾選一個抓取項目！")
@@ -169,6 +174,7 @@ class ScraperApp:
         self.cb_per.config(state='disabled')
         self.cb_inst.config(state='disabled')
         self.cb_bias.config(state='disabled')
+        self.cb_finance.config(state='disabled')
         self.log("="*30)
         self.log(f"啟動自動化區間多項目爬蟲任務 (任務目標: 往前 {year_limit} 年)...")
         self.log(f"最大冷卻預設間隔: 20 ~ {max_delay} 秒")
@@ -424,9 +430,200 @@ class ScraperApp:
             csv_path = os.path.join(task_dir, csv_filename)
             self.convert_xls_to_csv(xls_path, csv_path)
 
+    def _process_financial_report_scraper(self, driver, wait, stock_id, base_download_dir, year_limit, max_delay):
+        task = "財報"
+        task_dir = os.path.join(base_download_dir, stock_id, task)
+        os.makedirs(task_dir, exist_ok=True)
+        self.log(f"\n==========================================")
+        self.log(f"🌟 正在執行專屬項目：【 {task} 】 🌟")
+        self.log(f"==========================================")
+        self.log(f"設定 【{task}】 下載目的地為: {task_dir}")
+        self.update_status(f"【{task}】正在鎖定目標擷取區間...")
+        
+        # 設定 Chrome 下載行為給指定的 task_dir
+        driver.execute_cdp_cmd('Page.setDownloadBehavior', {
+            'behavior': 'allow',
+            'downloadPath': task_dir
+        })
+        
+        current_year_roc = datetime.now().year - 1911
+        start_year = current_year_roc
+        end_year = current_year_roc - year_limit + 1
+        if end_year < 1:
+            end_year = 1
+            
+        quarter_map = {"第一季": 1, "第二季": 2, "第三季": 3, "第四季": 4}
+        
+        for roc_year in range(start_year, end_year - 1, -1):
+            self.log(f"【{task}】開始檢查 {roc_year} 年度財報...")
+            
+            # 先列出該年度需要抓取的所有季別，並提前逐一檢查檔案是否已存在
+            missing_quarters = []
+            for q_num in range(1, 5):
+                expected_filename = f"財報_{roc_year}年_第{q_num}季.pdf"
+                expected_filepath = os.path.join(task_dir, expected_filename)
+                if os.path.exists(expected_filepath):
+                    self.log(f"【{task}】 {expected_filename} 已存在，略過。")
+                else:
+                    missing_quarters.append(q_num)
+            
+            # 若所有可能的檔案(1~4季)都不需要下載，在此判斷直接不執行存取網頁動作
+            if not missing_quarters:
+                self.log(f"【{task}】 {roc_year} 年度財報已下載齊全，略過網頁存取。")
+                continue
+                
+            self.update_status(f"【{task}】探索中: {roc_year} 年度")
+            url = f"https://doc.twse.com.tw/server-java/t57sb01?step=1&colorchg=1&co_id={stock_id}&year={roc_year}&seamon=&mtype=A&"
+            
+            try:
+                driver.get(url)
+                time.sleep(2)
+            except Exception as e:
+                self.log(f"【{task}】讀取 {roc_year} 年度頁面失敗: {e}")
+                continue
+                
+            try:
+                # 檢查是否包含「查無所需資料」
+                empty_msgs = driver.find_elements(By.XPATH, "//font[contains(text(), '查無所需資料')] | //h4[contains(text(), '查無所需資料')]")
+                if empty_msgs:
+                    self.log(f"【{task}】 {roc_year} 年度查無所需資料，略過。")
+                    continue
+            except Exception:
+                pass
+                
+            try:
+                rows = driver.find_elements(By.XPATH, "//tr[td]")
+            except Exception as e:
+                self.log(f"【{task}】解析 {roc_year} 年度表格失敗: {e}")
+                continue
+                
+            download_targets = []
+            for r_index in range(len(rows)):
+                try:
+                    # 重新尋找元素避免 stale element
+                    current_rows = driver.find_elements(By.XPATH, "//tr[td]")
+                    if r_index >= len(current_rows):
+                        break
+                    row = current_rows[r_index]
+                    tds = row.find_elements(By.TAG_NAME, "td")
+                    if len(tds) >= 8:
+                        year_quarter = tds[1].text
+                        desc = tds[5].text.strip()
+                        
+                        # 嚴格過濾只找合併資料(包含「合併財報」或「合併報表」)並剃除「英文版」和「個體」
+                        if ("合併財報" in desc or "合併報表" in desc) and "英文版" not in desc and "個體" not in desc:
+                            q_num = None
+                            for q_text, num in quarter_map.items():
+                                if q_text in year_quarter:
+                                    q_num = num
+                                    break
+                                    
+                            # 只把確定缺失 (在 missing_quarters 中) 的季度加入下載佇列
+                            if q_num and (q_num in missing_quarters):
+                                links = tds[7].find_elements(By.TAG_NAME, "a")
+                                if links:
+                                    download_targets.append({
+                                        "elem_idx": r_index,
+                                        "year": roc_year,
+                                        "quarter": q_num
+                                    })
+                except Exception as e:
+                    pass  # ignore row parsing errors
+                    
+            if not download_targets:
+                self.log(f"【{task}】 {roc_year} 年度未發現符合條件的「合併財報」。")
+                continue
+                
+            original_window = driver.current_window_handle
+            
+            for target in download_targets:
+                expected_filename = f"財報_{target['year']}年_第{target['quarter']}季.pdf"
+                expected_filepath = os.path.join(task_dir, expected_filename)
+                
+                self.log(f"【{task}】準備下載: {expected_filename}")
+                self.update_status(f"【{task}】下載中: {expected_filename}")
+                
+                try:
+                    current_rows = driver.find_elements(By.XPATH, "//tr[td]")
+                    row = current_rows[target["elem_idx"]]
+                    tds = row.find_elements(By.TAG_NAME, "td")
+                    a_elem = tds[7].find_elements(By.TAG_NAME, "a")[0]
+                    
+                    # 點擊開啟新視窗
+                    driver.execute_script("arguments[0].click();", a_elem)
+                    time.sleep(2)
+                    
+                    new_windows = [w for w in driver.window_handles if w != original_window]
+                    if not new_windows:
+                        self.log(f"【{task}】點擊後未發現新分頁 ({expected_filename})")
+                        continue
+                        
+                    driver.switch_to.window(new_windows[0])
+                    
+                    # 偵測是否被 TWSE 判定為「下載過量」
+                    time.sleep(1) # 等待頁面短暫渲染
+                    page_text = driver.page_source
+                    if "下載過量" in page_text:
+                        self.log(f"【{task}】🚨 遭到 TWSE 流量管制 (下載過量)！為保護您的 IP，將取消此檔案 ({expected_filename}) 的本次下載並強制暫停 30 秒。")
+                        time.sleep(30)
+                        raise Exception("TWSE_RATE_LIMIT (下載過量)")
+                            
+                    # 在新分頁找實際 PDF 連結
+                    pdf_link = wait.until(EC.presence_of_element_located((By.XPATH, "//a[contains(translate(@href, 'PDF', 'pdf'), '.pdf')] | //a[contains(text(), '.pdf')]")))
+                    
+                    files_before = set(os.listdir(task_dir))
+                    driver.execute_script("arguments[0].click();", pdf_link)
+                    
+                    # 等待下載完成
+                    success = self.wait_for_downloads(task_dir, len(files_before), timeout=45)
+                    
+                    if success:
+                        files_after = set(os.listdir(task_dir))
+                        new_files = list(files_after - files_before)
+                        if new_files:
+                            # 找出字尾是 pdf 的檔案
+                            pdf_files = [f for f in new_files if f.lower().endswith('.pdf')]
+                            if pdf_files:
+                                downloaded_file = os.path.join(task_dir, pdf_files[0])
+                                if os.path.exists(expected_filepath):
+                                    os.remove(expected_filepath)
+                                os.rename(downloaded_file, expected_filepath)
+                                self.log(f"【{task}】✅ 成功儲存: {expected_filename}")
+                            else:
+                                self.log(f"【{task}】未能辨識出下載的 PDF 檔案。")
+                    else:
+                        self.log(f"【{task}】下載超時或失敗: {expected_filename}")
+                        
+                except Exception as e:
+                    self.log(f"【{task}】下載過程異常 ({expected_filename})，如果是超時可能是遭到封鎖: {e}")
+                    if "driver" in locals() and len(driver.window_handles) > 1:
+                        # 印出當下錯誤畫面的前 100 字幫助除錯
+                        self.log(f"網頁內容 snippet: {driver.page_source[:100].replace(chr(10), ' ')}")
+                finally:
+                    # 無論成功失敗，都關閉新視窗並切回主視窗
+                    try:
+                        for window in driver.window_handles:
+                            if window != original_window:
+                                driver.switch_to.window(window)
+                                driver.close()
+                        driver.switch_to.window(original_window)
+                    except Exception:
+                        pass
+                    
+                    # 非常重要：在同一年度的不同季報之間，也必須插入冷卻時間避免被抓！
+                    intra_sleep = random.randint(10, max_delay)
+                    self.log(f"【{task}】為避免連續下載被鎖，套用最大冷卻時間機制，等待 {intra_sleep} 秒...")
+                    time.sleep(intra_sleep)
+            
+        self.log(f"【{task}】 {stock_id} 所有指定年度爬取完畢！")
+
     def _process_single_stock(self, driver, wait, stock_id, base_download_dir, year_limit, max_delay, tasks):
         # 依照勾選的項目依序執行
         for task in tasks:
+            if task == "財報":
+                self._process_financial_report_scraper(driver, wait, stock_id, base_download_dir, year_limit, max_delay)
+                continue
+                
             self.log(f"\n==========================================")
             self.log(f"🌟 正在執行新項目：【 {task} 】 🌟")
             self.log(f"==========================================")
@@ -612,7 +809,8 @@ class ScraperApp:
                 "download.prompt_for_download": False,
                 "download.directory_upgrade": True,
                 "safebrowsing.enabled": True,
-                "profile.default_content_setting_values.automatic_downloads": 1
+                "profile.default_content_setting_values.automatic_downloads": 1,
+                "plugins.always_open_pdf_externally": True
             }
             options.add_experimental_option("prefs", prefs)
             
@@ -664,6 +862,7 @@ class ScraperApp:
             self.cb_per.config(state='normal')
             self.cb_inst.config(state='normal')
             self.cb_bias.config(state='normal')
+            self.cb_finance.config(state='normal')
             self.log("系統已就緒釋放，可隨時嘗試新的股號與項目選項。\n" + "-"*50)
 
 if __name__ == "__main__":
